@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, MarkdownTransformContext, MarkdownTransformer, Theme } from "@earendil-works/pi-coding-agent";
 import { AssistantMessageComponent, CONFIG_DIR_NAME, ToolExecutionComponent, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { readFile } from "node:fs/promises";
@@ -96,6 +96,29 @@ function newRunStats(): RunStats {
 		commandCount: 0,
 		otherCount: 0,
 		failedCount: 0,
+	};
+}
+
+function createAssistantMarkdownTransform(
+	transformers: readonly MarkdownTransformer[],
+	isStreaming: boolean,
+): (markdown: string, availableWidth: number) => string {
+	return (markdown, availableWidth) => {
+		const context: MarkdownTransformContext = {
+			messageType: "assistant",
+			isStreaming,
+			availableWidth,
+		};
+		let transformedMarkdown = markdown;
+		for (const transformer of transformers) {
+			try {
+				const transformed = transformer(transformedMarkdown, context);
+				if (typeof transformed === "string") transformedMarkdown = transformed;
+			} catch {
+				// Keep the current Markdown and continue with the next transformer.
+			}
+		}
+		return transformedMarkdown;
 	};
 }
 
@@ -695,7 +718,8 @@ function patchAssistantMessageComponent() {
 	const existing = proto[ASSISTANT_PATCH_KEY] as { originalUpdateContent: (...args: any[]) => any } | undefined;
 	const originalUpdateContent = existing?.originalUpdateContent ?? proto.updateContent;
 
-	proto.updateContent = function patchedUpdateContent(message: any) {
+	proto.updateContent = function patchedUpdateContent(message: any, isStreaming = this.isStreaming) {
+		this.isStreaming = isStreaming;
 		state.assistantComponents.add(this);
 		state.thinkingHidden = !!this.hideThinkingBlock;
 		if (!state.thinkingHidden) clearCurrentThought();
@@ -721,8 +745,12 @@ function patchAssistantMessageComponent() {
 		state.currentBurst = [];
 
 		this.contentContainer.addChild(new Spacer(1));
+		const transform = createAssistantMarkdownTransform(
+			Array.isArray(this.markdownTransformers) ? this.markdownTransformers : [],
+			this.isStreaming,
+		);
 		for (const content of texts) {
-			this.contentContainer.addChild(new Markdown(content.text.trim(), this.outputPad, 0, this.markdownTheme));
+			this.contentContainer.addChild(new Markdown(content.text.trim(), this.outputPad, 0, this.markdownTheme, undefined, { transform }));
 		}
 	};
 

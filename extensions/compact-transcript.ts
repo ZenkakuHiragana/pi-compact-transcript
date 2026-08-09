@@ -26,6 +26,7 @@ type CompactTranscriptConfig = {
 	enabled: boolean;
 	summaryStyle: SummaryStyle;
 	highlightToolActions: boolean;
+	passthroughTools: string[];
 };
 
 type ToolInfo = {
@@ -93,6 +94,7 @@ const DEFAULT_CONFIG: CompactTranscriptConfig = {
 	enabled: true,
 	summaryStyle: "plain",
 	highlightToolActions: false,
+	passthroughTools: [],
 };
 
 const STATE_KEY = Symbol.for("pi-compact-transcript.state");
@@ -133,7 +135,11 @@ function normalizeConfig(input: unknown, fallback = DEFAULT_CONFIG): CompactTran
 	const highlightToolActions = typeof source.highlightToolActions === "boolean"
 		? source.highlightToolActions
 		: fallback.highlightToolActions;
-	return { enabled, summaryStyle, highlightToolActions };
+	const rawTools = source.passthroughTools;
+	const passthroughTools = Array.isArray(rawTools)
+		? [...new Set(rawTools.filter(isNonEmptyString).map((tool) => tool.trim()))]
+		: [...fallback.passthroughTools];
+	return { enabled, summaryStyle, highlightToolActions, passthroughTools };
 }
 
 function readConfigFile(path: string, fallback: CompactTranscriptConfig): CompactTranscriptConfig | undefined {
@@ -192,6 +198,10 @@ const state = getState();
 
 function isEnabled(): boolean {
 	return state.config.enabled;
+}
+
+function isPassthroughTool(name: string): boolean {
+	return state.config.passthroughTools.includes(name);
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -583,6 +593,11 @@ function recordToolStart(name: string, args: any) {
 }
 
 function joinBurst(info: ToolInfo) {
+	if (isPassthroughTool(info.name)) {
+		state.currentBurst = [];
+		return;
+	}
+
 	const previous = state.currentBurst[state.currentBurst.length - 1];
 
 	if (!isEnabled()) {
@@ -773,7 +788,7 @@ function patchToolExecutionComponent() {
 		const info = upsertToolInfo(this.toolCallId, this.toolName, this.args, invalidate);
 		applyResult(info, this.result, this.result?.isError ?? false, this.isPartial);
 
-		if (!isEnabled() || this.expanded) {
+		if (!isEnabled() || this.expanded || isPassthroughTool(this.toolName)) {
 			setToolHidden(info, false);
 			this.__compactTranscriptForceSelf = false;
 			this.__compactTranscriptHidden = false;
@@ -1049,7 +1064,8 @@ function restoreConfigFromBranch(ctx: ExtensionContext) {
 	let nextConfig = loadConfigFromFiles(ctx);
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type === "custom" && entry.customType === CONFIG_ENTRY_TYPE) {
-			nextConfig = normalizeConfig(entry.data, nextConfig);
+			const { enabled } = normalizeConfig(entry.data, nextConfig);
+			nextConfig.enabled = enabled;
 		}
 	}
 	state.config = nextConfig;

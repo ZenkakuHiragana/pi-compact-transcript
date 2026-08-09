@@ -56,6 +56,28 @@ Works best with hidden thinking and no output padding — set in `~/.pi/agent/se
 
 Thinking suppression only applies when `hideThinkingBlock` is on; with it off, pi renders thinking traces normally.
 
+## Extension configuration
+
+`passthroughTools` is an extension setting read from `~/.pi/agent/compact-transcript.json`. It defaults to an empty array, so the existing collapsed rendering is unchanged. Pi's standard `settings.json` is not used for this option.
+
+Create the personal config file when selected tools should keep Pi's original renderer:
+
+```json
+{
+  "passthroughTools": ["edit", "write"]
+}
+```
+
+A trusted project can override the personal list by adding `.pi/compact-transcript.json`. The project array replaces the personal array completely, including when it is empty:
+
+```json
+{
+  "passthroughTools": []
+}
+```
+
+Passthrough tools never join compact bursts, so compact tools before and after them remain separate. They still count toward the run summary, and their original renderer remains responsible for details such as edit/write diffs. The `/compact-transcript` command continues to control the session-level enabled state.
+
 ## Commands
 
 ```text

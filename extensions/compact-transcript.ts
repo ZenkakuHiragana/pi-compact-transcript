@@ -1,7 +1,9 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { AssistantMessageComponent, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { AssistantMessageComponent, CONFIG_DIR_NAME, ToolExecutionComponent, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { join } from "node:path";
 
 // Older versions of this extension wrote a footer status under this key; it is
 // kept only to clear that status once per session for users upgrading in place.
@@ -19,6 +21,7 @@ const MARKER_WIDTH = 2;
 
 type CompactTranscriptConfig = {
 	enabled: boolean;
+	passthroughTools: string[];
 };
 
 type ToolInfo = {
@@ -77,6 +80,7 @@ type RuntimeState = {
 
 const DEFAULT_CONFIG: CompactTranscriptConfig = {
 	enabled: true,
+	passthroughTools: [],
 };
 
 const STATE_KEY = Symbol.for("pi-compact-transcript.state");
@@ -95,6 +99,13 @@ function newRunStats(): RunStats {
 	};
 }
 
+function normalizePassthroughTools(input: unknown): string[] {
+	const source = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+	const rawTools = source.passthroughTools;
+	if (!Array.isArray(rawTools)) return [...DEFAULT_CONFIG.passthroughTools];
+	return [...new Set(rawTools.filter(isNonEmptyString).map((tool) => tool.trim()))];
+}
+
 function normalizeConfig(input: unknown): CompactTranscriptConfig {
 	const source = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
 	let enabled = DEFAULT_CONFIG.enabled;
@@ -104,7 +115,32 @@ function normalizeConfig(input: unknown): CompactTranscriptConfig {
 		// Pre-0.5 config persisted a mode string instead of an enabled flag.
 		enabled = source.mode !== "disabled" && source.mode !== "off";
 	}
-	return { enabled };
+	return { enabled, passthroughTools: normalizePassthroughTools(source) };
+}
+
+async function readConfigFile(path: string, ctx: ExtensionContext): Promise<string[] | undefined> {
+	try {
+		const content = await readFile(path, "utf8");
+		return normalizePassthroughTools(JSON.parse(content));
+	} catch (error) {
+		const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined;
+		if (code === "ENOENT") return undefined;
+
+		const message = error instanceof Error ? error.message : String(error);
+		ctx.ui.notify(`Failed to load ${path}: ${message}`, "error");
+		return undefined;
+	}
+}
+
+async function loadConfigFile(ctx: ExtensionContext): Promise<string[]> {
+	const personalPath = join(getAgentDir(), "compact-transcript.json");
+	const personalTools = await readConfigFile(personalPath, ctx);
+	const baseTools = personalTools ?? [...DEFAULT_CONFIG.passthroughTools];
+	if (!ctx.isProjectTrusted()) return baseTools;
+
+	const projectPath = join(ctx.cwd, CONFIG_DIR_NAME, "compact-transcript.json");
+	const projectTools = await readConfigFile(projectPath, ctx);
+	return projectTools ?? baseTools;
 }
 
 function getState(): RuntimeState {
@@ -126,6 +162,7 @@ function getState(): RuntimeState {
 	// /reload keeps the global object alive; initialize fields added by newer
 	// versions when an older extension instance created the state object.
 	runtimeState.thinkingHidden ??= true;
+	runtimeState.config.passthroughTools ??= [...DEFAULT_CONFIG.passthroughTools];
 	return runtimeState;
 }
 
@@ -133,6 +170,10 @@ const state = getState();
 
 function isEnabled(): boolean {
 	return state.config.enabled;
+}
+
+function isPassthroughTool(name: string): boolean {
+	return state.config.passthroughTools.includes(name);
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -452,6 +493,11 @@ function recordToolStart(name: string, args: any) {
 }
 
 function joinBurst(info: ToolInfo) {
+	if (isPassthroughTool(info.name)) {
+		state.currentBurst = [];
+		return;
+	}
+
 	const previous = state.currentBurst[state.currentBurst.length - 1];
 
 	if (!isEnabled()) {
@@ -591,7 +637,7 @@ function patchToolExecutionComponent() {
 		const info = upsertToolInfo(this.toolCallId, this.toolName, this.args, invalidate);
 		applyResult(info, this.result, this.result?.isError ?? false, this.isPartial);
 
-		if (!isEnabled() || this.expanded) {
+		if (!isEnabled() || this.expanded || isPassthroughTool(this.toolName)) {
 			setToolHidden(info, false);
 			this.__compactTranscriptForceSelf = false;
 			this.__compactTranscriptHidden = false;
@@ -756,19 +802,19 @@ function appendRunSummary(pi: ExtensionAPI) {
 	pi.appendEntry(SUMMARY_ENTRY_TYPE, data);
 }
 
-function restoreConfigFromBranch(ctx: ExtensionContext) {
-	let nextConfig = { ...DEFAULT_CONFIG };
+function restoreConfigFromBranch(ctx: ExtensionContext, passthroughTools: string[]) {
+	let enabled = DEFAULT_CONFIG.enabled;
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type === "custom" && entry.customType === CONFIG_ENTRY_TYPE) {
-			nextConfig = normalizeConfig(entry.data);
+			enabled = normalizeConfig(entry.data).enabled;
 		}
 	}
-	state.config = nextConfig;
+	state.config = { enabled, passthroughTools: [...passthroughTools] };
 }
 
 function setEnabled(enabled: boolean, pi: ExtensionAPI, ctx: ExtensionContext) {
 	state.config.enabled = enabled;
-	pi.appendEntry(CONFIG_ENTRY_TYPE, { ...state.config });
+	pi.appendEntry(CONFIG_ENTRY_TYPE, { enabled: state.config.enabled });
 	refreshTranscript();
 	ctx.ui.notify(`Compact transcript: ${enabled ? "on" : "off"}`, "info");
 }
@@ -823,7 +869,8 @@ export default function compactTranscript(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		restoreConfigFromBranch(ctx);
+		const passthroughTools = await loadConfigFile(ctx);
+		restoreConfigFromBranch(ctx, passthroughTools);
 		captureTheme(ctx);
 		// Drop all per-tool state and component registries from the previous
 		// session; stale burst counts otherwise corrupt the rebuilt transcript
